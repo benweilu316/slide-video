@@ -6,6 +6,9 @@ $log = Join-Path $logDir ((Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
 $prompt = Get-Content -Raw -Encoding UTF8 (Join-Path $repo 'maintain\prompt.md')
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claude) { "claude 不在 PATH" | Out-File $log -Encoding utf8; exit 1 }
-& $claude.Source -p $prompt --permission-mode acceptEdits --add-dir $repo --output-format text 2>&1 | Out-File $log -Encoding utf8
+"start=$(Get-Date -Format o)" | Out-File $log -Encoding utf8
+"claude=$($claude.Source)" | Out-File $log -Append -Encoding utf8
+& $claude.Source -p $prompt --permission-mode acceptEdits --add-dir $repo --output-format text 2>&1 |
+    ForEach-Object { $_ | Out-File $log -Append -Encoding utf8 }
 "exit=$LASTEXITCODE" | Out-File $log -Append -Encoding utf8
 exit $LASTEXITCODE
