@@ -213,11 +213,51 @@ def download_yutto(url, outdir):
     return r.returncode, err + "\n" + out
 
 
+def download_douyin(url, outdir):
+    """公开页面的 HTML 里就有播放地址。无头浏览器打开一次，不带登录状态。
+    页面没给地址就返回 None，交给调用方停下来。"""
+    chrome = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+    if not os.path.isfile(chrome):
+        return None
+    work = tempfile.mkdtemp(prefix="douyin-")
+    html = os.path.join(work, "page.html")
+    try:
+        r = run([
+            chrome, "--headless=new", "--disable-gpu", "--user-data-dir=" + work,
+            "--virtual-time-budget=12000", "--dump-dom", url,
+        ], timeout=60)
+        text = (r.stdout or b"").decode("utf-8", "replace")
+        io_open = open(html, "w", encoding="utf-8")
+        io_open.write(text)
+        io_open.close()
+        found = re.findall(r"https?://[^\"']*douyinvod[^\"']*", text)
+        if not found:
+            return None
+        src = found[0].replace("&amp;", "&")
+        dest = os.path.join(outdir, "source.mp4")
+        d = run([
+            "curl", "-L", "--fail", "--retry", "2", "-A", "Mozilla/5.0",
+            "-e", "https://www.douyin.com/", "-o", dest, src,
+        ], timeout=300)
+        if d.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            return dest
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def download(url, outdir):
     started = os.path.getmtime(outdir) if os.path.isdir(outdir) else 0
     mark = max(started, 0)
     host = re.sub(r"^https?://", "", url).split("/")[0].lower()
     bilibili = "bilibili.com" in host or host.endswith("b23.tv")
+    douyin = "douyin.com" in host
+    if douyin:
+        got = download_douyin(url, outdir)
+        if got:
+            return got
+        sys.stderr.write("抖音公开页面没有给出播放地址。私密、要登录、已删除的视频停在这里。\n")
+        sys.exit(2)
     code, err = download_ytdlp(url, outdir)
     got = newest_media(outdir, mark)
     if code == 0 and got:
@@ -256,7 +296,15 @@ def transcribe(video, outdir):
     return {"path": path, "lines": len(lines), "language": info.language, "rows": rows}
 
 
-def write_index(path, meta, kept, dropped):
+def span_text(rows, t):
+    """取离这一帧最近的那一段口播。"""
+    if not rows:
+        return ""
+    hit = min(rows, key=lambda r: abs((r["start"] + r["end"]) / 2.0 - t))
+    return hit["text"]
+
+
+def write_index(path, meta, kept, dropped, rows=None):
     lines = [
         "# 幻灯片",
         "",
@@ -278,6 +326,9 @@ def write_index(path, meta, kept, dropped):
             "时间 %.3f 秒，清晰度 %.0f。" % (it["t"], it["sharp"]),
             "",
         ]
+        said = span_text(rows, it["t"])
+        if said:
+            lines += ["口播：%s" % said, ""]
     if dropped:
         lines.append("## 丢掉的帧")
         lines.append("")
@@ -347,8 +398,9 @@ def extract(video, outdir, threshold, settle, tail, limit, transcribe_audio=True
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     meta = {"input": video, "duration": dur, "threshold": threshold, "cuts": len(cuts)}
-    write_index(os.path.join(outdir, "index.md"), meta, kept, dropped)
     speech = transcribe(video, outdir) if transcribe_audio else None
+    rows = speech["rows"] if speech else None
+    write_index(os.path.join(outdir, "index.md"), meta, kept, dropped, rows)
     # 候选帧比口播段数多出一倍以上，说明切页被同镜头里的表情和手势带动了。
     # 改按口播停顿重新取帧。幻灯片视频的候选数和页数接近，不会走到这里。
     if speech and speech["rows"]:
@@ -372,7 +424,7 @@ def extract(video, outdir, threshold, settle, tail, limit, transcribe_audio=True
             finally:
                 shutil.rmtree(tmp2, ignore_errors=True)
             meta["cuts"] = len(spans)
-            write_index(os.path.join(outdir, "index.md"), meta, kept, dropped)
+            write_index(os.path.join(outdir, "index.md"), meta, kept, dropped, rows)
     result = {"kept": len(kept), "dropped": len(dropped), "cuts": len(cuts), "duration": dur}
     if speech:
         result["speech_lines"] = speech["lines"]
