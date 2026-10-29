@@ -27,6 +27,10 @@ SHARP_FLOOR_RATIO = 0.35
 DEDUP_MAD = 6.0
 MAX_SLIDES = 80
 GRAY_W, GRAY_H = 160, 90
+# 口播视频的字幕条贴在画面顶部和底部。整帧一比较，字幕换一行就被当成翻页。
+# 切页只看中间这一段；留存的帧仍是完整画面，字幕本身不裁掉。
+CROP_TOP = 0.18
+CROP_BOTTOM = 0.72
 
 
 def run(cmd, timeout=600):
@@ -64,8 +68,9 @@ def duration_of(path):
 
 
 def scene_cuts(path, threshold):
-    """返回画面突变的时间点（秒）。stderr 里的 pts_time 是 ffmpeg 的原始输出。"""
-    vf = "select='gt(scene,%.4f)',showinfo" % threshold
+    """返回画面突变的时间点（秒）。比较前先裁掉顶部和底部字幕带。"""
+    vf = "crop=iw:ih*%.2f:0:ih*%.2f,select='gt(scene,%.4f)',showinfo" % (
+        CROP_BOTTOM - CROP_TOP, CROP_TOP, threshold)
     r = run(["ffmpeg", "-hide_banner", "-i", path, "-vf", vf, "-fps_mode", "vfr", "-f", "null", "-"])
     err = (r.stderr or b"").decode("utf-8", "replace")
     times = []
@@ -103,9 +108,11 @@ def grab(video, t, dest):
 
 
 def gray(path):
+    """缩放成灰度，并裁掉字幕带。去重和清晰度都只看画面主体。"""
     r = run([
         "ffmpeg", "-hide_banner", "-i", path,
-        "-vf", "scale=%d:%d,format=gray" % (GRAY_W, GRAY_H),
+        "-vf", "crop=iw:ih*%.2f:0:ih*%.2f,scale=%d:%d,format=gray" % (
+            CROP_BOTTOM - CROP_TOP, CROP_TOP, GRAY_W, GRAY_H),
         "-f", "rawvideo", "-v", "error", "-",
     ], timeout=60)
     buf = r.stdout or b""
@@ -241,11 +248,12 @@ def transcribe(video, outdir):
         return None
     model = WhisperModel("small", device="cpu", compute_type="int8")
     segments, info = model.transcribe(video, language="zh", vad_filter=True)
-    lines = ["[%.1f-%.1f] %s" % (s.start, s.end, s.text.strip()) for s in segments]
+    rows = [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments]
+    lines = ["[%.1f-%.1f] %s" % (r["start"], r["end"], r["text"]) for r in rows]
     path = os.path.join(outdir, "speech.txt")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
-    return {"path": path, "lines": len(lines), "language": info.language}
+    return {"path": path, "lines": len(lines), "language": info.language, "rows": rows}
 
 
 def write_index(path, meta, kept, dropped):
@@ -280,7 +288,35 @@ def write_index(path, meta, kept, dropped):
         f.write("\n".join(lines))
 
 
-def extract(video, outdir, threshold, settle, tail, limit):
+def speech_spans(segments, duration):
+    """把连着说的句子合成一段。停顿超过 0.8 秒，或者一连超过 12 秒，就另起一段。"""
+    spans = []
+    start = None
+    end = None
+    for seg in segments:
+        if start is None:
+            start, end = seg["start"], seg["end"]
+            continue
+        if seg["start"] - end > 0.8 or seg["end"] - start > 12:
+            spans.append((start, end))
+            start = seg["start"]
+        end = seg["end"]
+    if start is not None:
+        spans.append((start, min(end, duration)))
+    return spans
+
+
+def talking_head(video, duration, segments):
+    """同一镜头里人脸和手势一直在动，按画面切会把一句话切成十几张。
+    这种视频改按口播的停顿分段，每段留一张。幻灯片切换不会触发这里：
+    硬切的画面差异远大于同镜头里的表情变化。"""
+    spans = speech_spans(segments, duration)
+    if len(spans) < 2:
+        return None
+    return [round((a + b) / 2.0, 3) for a, b in spans]
+
+
+def extract(video, outdir, threshold, settle, tail, limit, transcribe_audio=True):
     require_ffmpeg()
     os.makedirs(outdir, exist_ok=True)
     frame_dir = os.path.join(outdir, "frames")
@@ -312,7 +348,31 @@ def extract(video, outdir, threshold, settle, tail, limit):
         shutil.rmtree(tmp, ignore_errors=True)
     meta = {"input": video, "duration": dur, "threshold": threshold, "cuts": len(cuts)}
     write_index(os.path.join(outdir, "index.md"), meta, kept, dropped)
-    speech = transcribe(video, outdir)
+    speech = transcribe(video, outdir) if transcribe_audio else None
+    # 候选帧比口播段数多出一倍以上，说明切页被同镜头里的表情和手势带动了。
+    # 改按口播停顿重新取帧。幻灯片视频的候选数和页数接近，不会走到这里。
+    if speech and speech["rows"]:
+        spans = speech_spans(speech["rows"], dur)
+        if len(times) > max(6, len(spans) * 2):
+            times = [round((a + b) / 2.0, 3) for a, b in spans]
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            os.makedirs(frame_dir, exist_ok=True)
+            tmp2 = tempfile.mkdtemp(prefix="slide-")
+            try:
+                items = []
+                for i, t in enumerate(times):
+                    dest = os.path.join(tmp2, "c_%03d.jpg" % i)
+                    if not grab(video, t, dest):
+                        continue
+                    g = gray(dest)
+                    items.append({"t": t, "path": dest, "sharp": sharpness(g) if g else 0, "gray": g or b""})
+                kept, dropped = items, []
+                for i, it in enumerate(kept, 1):
+                    shutil.copyfile(it["path"], os.path.join(frame_dir, "slide_%03d.jpg" % i))
+            finally:
+                shutil.rmtree(tmp2, ignore_errors=True)
+            meta["cuts"] = len(spans)
+            write_index(os.path.join(outdir, "index.md"), meta, kept, dropped)
     result = {"kept": len(kept), "dropped": len(dropped), "cuts": len(cuts), "duration": dur}
     if speech:
         result["speech_lines"] = speech["lines"]
@@ -347,7 +407,8 @@ def selftest():
             "-vf", "boxblur=lr=12:lp=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", blur,
         ])
         out = os.path.join(root, "out")
-        result = extract(slides, out, SCENE_THRESHOLD, SETTLE_SEC, TAIL_SEC, MAX_SLIDES)
+        result = extract(slides, out, SCENE_THRESHOLD, SETTLE_SEC, TAIL_SEC, MAX_SLIDES,
+                         transcribe_audio=False)
         n = result["kept"]
         frames = sorted(os.listdir(os.path.join(out, "frames")))
         index = open(os.path.join(out, "index.md"), encoding="utf-8").read()
@@ -356,19 +417,37 @@ def selftest():
         sharp_slide = sharpness(gray(os.path.join(out, "frames", "slide_001.jpg")))
         # 糊视频：三页内容被抹掉，清晰度应明显低于清晰版
         out2 = os.path.join(root, "out2")
-        result2 = extract(blur, out2, SCENE_THRESHOLD, SETTLE_SEC, TAIL_SEC, MAX_SLIDES)
+        result2 = extract(blur, out2, SCENE_THRESHOLD, SETTLE_SEC, TAIL_SEC, MAX_SLIDES,
+                          transcribe_audio=False)
+        # 同一背景、只有底部字幕在变：不应被切成多页。
+        talking = os.path.join(root, "talking.mp4")
+        run([
+            "ffmpeg", "-hide_banner", "-y", "-f", "lavfi",
+            "-i", "color=c=0x202020:s=640x360:d=4",
+            "-vf", ("drawtext=fontfile=%s:text='SAME FACE':fontsize=42:fontcolor=white:x=40:y=150,"
+                    "drawtext=fontfile=%s:text='caption one':fontsize=28:fontcolor=yellow:x=40:y=300:"
+                    "enable='lt(t,2)',"
+                    "drawtext=fontfile=%s:text='caption two is different':fontsize=28:fontcolor=yellow:x=40:y=300:"
+                    "enable='gte(t,2)'") % (font, font, font),
+            "-pix_fmt", "yuv420p", talking,
+        ])
+        out3 = os.path.join(root, "out3")
+        result3 = extract(talking, out3, SCENE_THRESHOLD, SETTLE_SEC, TAIL_SEC, MAX_SLIDES,
+                          transcribe_audio=False)
         sharp_blur = 0.0
         bdir = os.path.join(out2, "frames")
         if os.path.isdir(bdir) and os.listdir(bdir):
             sharp_blur = max(sharpness(gray(os.path.join(bdir, name))) for name in os.listdir(bdir))
         blur_ok = sharp_blur < sharp_slide * 0.5
+        caption_ok = result3["kept"] == 1
         report = {
             "hard_cuts_kept": n,
             "hard_cuts_expected": 3,
             "sharp": round(sharp_slide, 1),
             "blur_max": round(sharp_blur, 1),
             "blur_lower": blur_ok,
-            "pass": bool(ok and blur_ok),
+            "caption_change_kept": result3["kept"],
+            "pass": bool(ok and blur_ok and caption_ok),
         }
         sys.stdout.write(json.dumps(report, ensure_ascii=False) + "\n")
         return 0 if report["pass"] else 1
